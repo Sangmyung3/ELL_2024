@@ -14,28 +14,33 @@ from sklearn.linear_model import Ridge
 from sklearn.linear_model import LinearRegression
 import sqlite3
 import random
-from functions import get_data
+from functions import get_data,get_Gram_rbf
 import xgboost as xgb
 import tensorflow as tf
 
 # Transform:
-Transformation = 'No Transform'
-# Transformation = 'Transform' 
+# Transformation = 'No Transform'
+Transformation = 'Transform' 
 # :Transforms according to the recommendations given by McCracken and Ng (2015) for all but Group 7 (Prices),
 #  which are transformed as year over year growth
 
-Target = 'Inflation'
+# Target = 'Inflation'
+Target = 'Inflation MoM'
 
 price_var = ['WPSFD49207', 'WPSFD49502', 'WPSID61', 'WPSID62', 'OILPRICEx', 'PPICMM', 'CPIAUCSL', 
              'CPIAPPSL', 'CPITRNSL', 'CPIMEDSL', 'CUSR0000SAC', 'CUSR0000SAD', 'CUSR0000SAS', 
              'CPIULFSL', 'CUSR0000SA0L2', 'CUSR0000SA0L5', 'PCEPI', 'DDURRG3M086SBEA', 'DNDGRG3M086SBEA', 'DSERRG3M086SBEA']
 
-lags = 12
+if Target =='Inflation':
+    lags = 12
+elif Target =='Inflation MoM':
+    lags = 1
+
 X_used, Y_used, Date_used = get_data(Transformation, lags)
 
 n = X_used.shape[0]
 
-forecast_period = (pd.to_datetime('2015-01-01')<=Date_used) & (pd.to_datetime('2020-01-01')>Date_used)
+forecast_period = pd.to_datetime('2015-01-01')<=Date_used
 forecast_idx = np.where(forecast_period)[0]
 n_test = np.sum(forecast_period)
 
@@ -69,7 +74,7 @@ plt.title("Inflation: $\log CPI_t-\log CPI_{t-12}$")
 plt.savefig(os.path.join('Figures', 'inflation_yoy.png'))
 plt.close()
 
-Validation_Err = {}
+CV_grid_n = 30
 
 # Seed number used
 seed_list = [42, 43, 44, 45, 46]
@@ -99,7 +104,27 @@ for seed in seed_list:
         con.commit()
     else:
         print("DATABASE ALREADY EXISTS")
+
+
+    if ~np.isin('CV_Error', table_names):
+        print("CREATE NEW DATABASE TABLE")
+        str_append = ''
+        for s in np.arange(1,CV_grid_n+1):
+            str_append = str_append+'col_%i REAL, '%s
+
+        cur.execute("""CREATE TABLE IF NOT EXISTS CV_Error(
+                    Model TEXT NOT NULL,
+                    Target TEXT NOT NULL,
+                    Tune_Param TEXT NOT NULL,
+                    Seed INTEGER NOT NULL,
+                    Transformation TEXT NOT NULL,
+                    Window_size INTEGER NOT NULL,
+                    Validation_size INTEGER NOT NULL,"""\
+                    + str_append\
+                    + """PRIMARY KEY (Model, Target, Tune_Param, Seed, Transformation, Window_size, Validation_size))""")
         con.commit()
+    else:
+        print("DATABASE TABLE ALREADY EXISTS")
     #######################################################################################
     ################################   AR(1), AR(12)  #####################################
     #######################################################################################
@@ -145,6 +170,99 @@ for seed in seed_list:
             }
     AR12_out = pd.DataFrame.from_dict(AR12_out)
 
+    OLS = LinearRegression(fit_intercept=True)
+    OLS.fit(X_train[['CPIAUCSL','CPIAUCSL_lag11']], Y_train)
+    # OLS.coef_
+
+    Y_hat = OLS.predict(X_test[['CPIAUCSL','CPIAUCSL_lag11']])
+    RMSE_AR1_12 = np.sqrt(np.mean((Y_test-Y_hat)**2))
+
+    AR1_12_out = {'Date': Date_used[forecast_idx].dt.strftime("%m/%d/%Y").values,
+            'Target': Target,
+            'Value': Y_test.values,
+            'Prediction': Y_hat,
+            'Model': 'AR1_12',
+            'Seed': seed,
+            'Parameter': '',
+            'Window_size': n_train,
+            'Validation_size': n_val,
+            'Transformation': Transformation
+            }
+    AR1_12_out = pd.DataFrame.from_dict(AR1_12_out)
+
+
+    #######################################################################################
+    ################################   Rolling Average  ###################################
+    #######################################################################################
+    average_n_list = np.linspace(1,50,CV_grid_n).astype(int)
+
+    val_err = np.zeros((n_val, len(average_n_list)))
+    Y_long = pd.concat((Y_train, Y_val),axis=0)
+    for i in range(len(Y_val)):
+        for cv_i, average_n in enumerate(average_n_list):
+            Y_hat = np.mean(Y_long.iloc[i+n_train-average_n:i+n_train])
+            val_err[i, cv_i] = Y_val.iloc[i] - Y_hat
+
+    min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
+    val_err_RA = np.mean(np.array(val_err)**2, axis=0)
+
+    RA_VE_out = {'Model':['RA']*2,
+                 'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','RA_lags'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        try:
+            RA_VE_out[cn] = [average_n_list[i], val_err_RA[i]]
+        except:
+            RA_VE_out[cn] = [None, None]
+
+    RA_VE_out = pd.DataFrame(RA_VE_out)
+
+    # plt.plot(average_n_list, val_err_RA)
+    # plt.xlabel('average number')
+    # plt.title('Validation Error, Random Forest, Minimum=%s'%str(average_n_list[min_idx]))
+    # # plt.savefig("Figures/RF_validation_seed%i.png"%seed)
+    # # plt.close()
+    # plt.show()
+
+    # test_err = np.zeros((n_test, len(average_n_list)))
+    # Y_long = pd.concat((Y_val, Y_test),axis=0)
+    # Y_hat = np.zeros((n_test,))
+    # for i in range(len(Y_test)):
+    #     for cv_i, average_n in enumerate(average_n_list):
+    #         Y_hat[i] = np.mean(Y_long.iloc[i+n_val-average_n:i+n_val])
+    #         test_err[i, cv_i] = Y_test.iloc[i] - Y_hat[i]
+    # RMSE_RA = np.sqrt(np.mean(np.array(test_err)**2, axis=0))[min_idx]
+
+    average_n = average_n_list[min_idx]
+    test_err = np.zeros((n_test,))
+    Y_long = pd.concat((Y_val, Y_test), axis=0)
+    Y_hat = np.zeros((n_test,))
+    for i in range(len(Y_test)):
+        Y_hat[i] = np.mean(Y_long.iloc[i+n_val-average_n:i+n_val])
+        test_err[i] = Y_test.iloc[i] - Y_hat[i]
+    
+    RMSE_RA = np.sqrt(np.mean(np.array(test_err)**2, axis=0))
+
+    RA_out = {'Date': Date_used[forecast_idx].dt.strftime("%m/%d/%Y").values,
+            'Target': Target,
+            'Value': Y_test.values,
+            'Prediction': Y_hat,
+            'Model': 'RA',
+            'Seed': seed,
+            'Parameter': str(average_n_list[min_idx]),
+            'Window_size': n_train,
+            'Validation_size': n_val,
+            'Transformation': Transformation
+            }
+    RA_out = pd.DataFrame.from_dict(RA_out)
+    
+
+
     #######################################################################################
     ################################   AR, Validate  #####################################
     #######################################################################################
@@ -166,9 +284,21 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_AR = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['AR',seed] = pd.DataFrame()
-    Validation_Err['AR',seed]['ar_p_list'] = ar_p_list
-    Validation_Err['AR',seed]['val_err'] = val_err_AR
+    AR_VE_out = {'Model':['AR']*2,
+                 'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','AR_lags'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        try:
+            AR_VE_out[cn] = [ar_p_list[i], val_err_AR[i]]
+        except:
+            AR_VE_out[cn] = [None, None]
+
+    AR_VE_out = pd.DataFrame(AR_VE_out)
 
     plt.plot(ar_p_list,val_err_AR)
     plt.xlabel('number of lags')
@@ -218,7 +348,8 @@ for seed in seed_list:
     #######################################################################################
     ################################   Random Forest  #####################################
     #######################################################################################
-    max_depth_list = np.append(np.arange(1,50,3),None)
+    
+    max_depth_list = np.append(np.linspace(1,50,CV_grid_n-1).astype(int),None)
     
     val_err = np.zeros((n_val, len(max_depth_list)))
     RFmodel_dict = {}
@@ -235,11 +366,20 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_RF = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['RF',seed] = pd.DataFrame()
-    Validation_Err['RF',seed]['max_depth_list'] = max_depth_list
-    Validation_Err['RF',seed]['val_err'] = val_err_RF
-
     temp_grid = ['None' if x==None else x for x in max_depth_list]
+    RF_VE_out = {'Model':['Random Forest']*2,
+                 'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','max_depth'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        RF_VE_out[cn] = [temp_grid[i], val_err_RF[i]]
+
+    RF_VE_out = pd.DataFrame(RF_VE_out)
+
     plt.plot(temp_grid, val_err_RF)
     plt.xlabel('max_depth')
     plt.title('Validation Error, Random Forest, argmin=%s'%str(temp_grid[min_idx]))
@@ -268,7 +408,7 @@ for seed in seed_list:
     #######################################################################################
     ###################################   XGBoost  ########################################
     #######################################################################################
-    n_estimators_list = np.arange(1,50,3)
+    n_estimators_list = np.linspace(1,50,CV_grid_n).astype(int)
     val_err = np.zeros((n_val,len(n_estimators_list)))
     XGBmodel_dict = {}
     for cv_i, n_estimators in enumerate(n_estimators_list):
@@ -280,9 +420,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_XGB = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['XGB',seed] = pd.DataFrame()
-    Validation_Err['XGB',seed]['n_estimators_list'] = n_estimators_list
-    Validation_Err['XGB',seed]['val_err'] = val_err_XGB
+    XGB_VE_out = {'Model':['XGBoost']*2,
+                  'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','n_estimators'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        XGB_VE_out[cn] = [n_estimators_list[i], val_err_XGB[i]]
+
+    XGB_VE_out = pd.DataFrame(XGB_VE_out)
 
     plt.plot(n_estimators_list,val_err_XGB)
     plt.xlabel('n_estimators')
@@ -314,7 +463,7 @@ for seed in seed_list:
     
     num_parallel_tree = 100
     subsample = np.sqrt(X_train_nnan.shape[0])/X_train_nnan.shape[0]
-    n_estimators_list = np.arange(1,50,3)
+    n_estimators_list = np.linspace(1,50,CV_grid_n).astype(int)
     val_err = np.zeros((n_val,len(n_estimators_list)))
     XGBmodel_dict = {}
     for cv_i, n_estimators in enumerate(n_estimators_list):
@@ -328,10 +477,19 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_XGBs = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['XGBs',seed] = pd.DataFrame()
-    Validation_Err['XGBs',seed]['n_estimators_list'] = n_estimators_list
-    Validation_Err['XGBs',seed]['val_err'] = val_err_XGBs
 
+    XGBs_VE_out = {'Model':['XGBoost-subsample']*2,
+                   'Target':[Target]*2,
+                    'Tune_Param': ['CV_grid','n_estimators'],
+                    'Seed':[seed]*2,
+                    'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        XGBs_VE_out[cn] = [n_estimators_list[i], val_err_XGBs[i]]
+
+    XGBs_VE_out = pd.DataFrame(XGBs_VE_out)
 
     plt.plot(n_estimators_list, val_err_XGBs)
     plt.xlabel('n_estimators')
@@ -364,7 +522,7 @@ for seed in seed_list:
     X_val_stzd = (X_val_nnan - np.mean(X_train_nnan, axis=0))/np.std(X_train_nnan, axis = 0)
     X_test_stzd = (X_test_nnan - np.mean(X_train_nnan, axis=0))/np.std(X_train_nnan, axis = 0)    
 
-    alpha_list =np.linspace(0,10000,50)
+    alpha_list = np.linspace(0,10000,CV_grid_n)
     val_err = np.zeros((n_val,len(alpha_list)))
     Ridgemodel_dict = {}
     for cv_i, alpha in enumerate(alpha_list):
@@ -377,9 +535,19 @@ for seed in seed_list:
     min_idx_ridge = min_idx
     val_err_Ridge = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['Ridge',seed] = pd.DataFrame()
-    Validation_Err['Ridge',seed]['alpha_list'] = alpha_list
-    Validation_Err['Ridge',seed]['val_err'] = val_err_Ridge
+    Ridge_VE_out = {'Model':['Ridge']*2,
+                    'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','alpha'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        Ridge_VE_out[cn] = [alpha_list[i], val_err_Ridge[i]]
+
+    Ridge_VE_out = pd.DataFrame(Ridge_VE_out)
+
 
     plt.plot(alpha_list,val_err_Ridge)
     plt.xlabel('alpha')
@@ -409,7 +577,7 @@ for seed in seed_list:
     #######################################################################################
     ###################################   LASSO    ########################################
     #######################################################################################
-    alpha_list = np.linspace(1e-15,0.001,50)
+    alpha_list = np.linspace(1e-15,0.001,CV_grid_n)
     val_err = np.zeros((n_val,len(alpha_list)))
     Lassomodel_dict = {}
     for cv_i, alpha in enumerate(alpha_list):
@@ -421,9 +589,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_Lasso = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['LASSO',seed] = pd.DataFrame()
-    Validation_Err['LASSO',seed]['alpha_list'] = alpha_list
-    Validation_Err['LASSO',seed]['val_err'] = val_err_Lasso
+    Lasso_VE_out = {'Model':['LASSO']*2,
+                    'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','alpha'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        Lasso_VE_out[cn] = [alpha_list[i], val_err_Lasso[i]]
+
+    Lasso_VE_out = pd.DataFrame(Lasso_VE_out)
 
     plt.plot(alpha_list, val_err_Lasso)
     plt.xlabel('alpha')
@@ -450,60 +627,6 @@ for seed in seed_list:
             'Transformation': Transformation
             }
     Lasso_out = pd.DataFrame.from_dict(Lasso_out)
-
-    #######################################################################################
-    ###################################   ADALASSO    #####################################
-    #######################################################################################
-    X_train_stzd = (X_train_nnan - np.mean(X_train_nnan, axis=0))/np.std(X_train_nnan, axis = 0)
-    X_val_stzd = (X_val_nnan - np.mean(X_train_nnan, axis=0))/np.std(X_train_nnan, axis = 0)
-    X_test_stzd = (X_test_nnan - np.mean(X_train_nnan, axis=0))/np.std(X_train_nnan, axis = 0)    
-
-    OLS = LinearRegression(fit_intercept=True)
-    OLS.fit(X_train_stzd,Y_train)
-    X_train_stzd_tilde = X_train_stzd*np.abs(OLS.coef_)
-    X_val_stzd_tilde = X_val_stzd*np.abs(OLS.coef_)
-    X_test_stzd_tilde = X_test_stzd*np.abs(OLS.coef_)
-
-    alpha_list = np.linspace(1e-15,0.00001,50)
-    val_err = np.zeros((n_val,len(alpha_list)))
-    AdaLassomodel_dict = {}
-    for cv_i, alpha in enumerate(alpha_list):
-        AdaLassomodel_dict[cv_i] = Lasso(alpha=alpha, fit_intercept=True,  warm_start=True, random_state=seed)
-        AdaLassomodel_dict[cv_i].fit(X_train_stzd_tilde, Y_train)
-        Y_hat = AdaLassomodel_dict[cv_i].predict(X_val_stzd_tilde) 
-        val_err[:, cv_i] = Y_val.values-Y_hat
-
-    min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
-    val_err_AdaLasso = np.mean(np.array(val_err)**2, axis=0)
-
-    Validation_Err['ADALASSO',seed] = pd.DataFrame()
-    Validation_Err['ADALASSO',seed]['alpha_list'] = alpha_list
-    Validation_Err['ADALASSO',seed]['val_err'] = val_err_AdaLasso
-
-    plt.plot(alpha_list, val_err_AdaLasso)
-    plt.xlabel('alpha')
-    plt.title('Validation Error, ADALASSO, argmin=%0.7f'%alpha_list[min_idx])
-    plt.savefig("Figures/ADALASSO_validation_seed%i.png"%seed)
-    plt.close()
-    # plt.show()
-
-    Y_hat = AdaLassomodel_dict[min_idx].predict(X_test_stzd_tilde)
-    test_err_Lasso = Y_test.values - Y_hat
-    RMSE_AdaLasso = np.sqrt(np.sum(test_err_Lasso**2)/len(test_err_Lasso))
-
-    AdaLasso_out = {'Date': Date_used[forecast_idx].dt.strftime("%m/%d/%Y").values,
-            'Target': Target,
-            'Value': Y_test.values,
-            'Prediction': Y_hat,
-            'Model': 'ADALASSO',
-            'Seed': seed,
-            'Parameter': str(alpha_list[min_idx]),
-            'Window_size': n_train,
-            'Validation_size': n_val,
-            'Transformation': Transformation
-            }
-    AdaLasso_out = pd.DataFrame.from_dict(AdaLasso_out)
-
 
     #######################################################################################
     ##############################   ADALASSO (BIC,AIC)   #################################
@@ -534,10 +657,19 @@ for seed in seed_list:
 
     min_idx_AIC = np.argmin(AIC)
     min_idx_BIC = np.argmin(BIC)
+    
+    AdaLasso_VE_out = {'Model':['ADALASSO']*2,
+                       'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','alpha'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        AdaLasso_VE_out[cn] = [alpha_list[i], val_err_AdaLasso[i]]
 
-    Validation_Err['ADALASSO',seed] = pd.DataFrame()
-    Validation_Err['ADALASSO',seed]['alpha_list'] = alpha_list
-    Validation_Err['ADALASSO',seed]['val_err'] = val_err_AdaLasso
+    AdaLasso_VE_out = pd.DataFrame(AdaLasso_VE_out)
 
     plt.plot(alpha_list, val_err_AdaLasso)
     plt.xlabel('alpha')
@@ -567,7 +699,7 @@ for seed in seed_list:
     ####################################   PCR    #########################################
     #######################################################################################
     Sigma_hat = X_train_stzd.T@X_train_stzd/n_train
-    eigval, eigvec = np.linalg.eig((Sigma_hat+Sigma_hat.T)/2)
+    eigval, eigvec = np.linalg.eigh(Sigma_hat)
     eigval = np.real(eigval)
     eigvec = np.real(eigvec)
     idx = eigval.argsort()[::-1]
@@ -587,12 +719,12 @@ for seed in seed_list:
     # plt.show()
 
 
-    nfactors_list = np.arange(1,200)
+    nfactors_list = np.linspace(1,200,CV_grid_n).astype(int)
+    
     val_err = np.zeros((n_val, len(nfactors_list)))
-    nfactors = 2
     OLS_dict = {}
     for cv_i, nfactors in enumerate(nfactors_list):
-        OLS = LinearRegression(fit_intercept=False)
+        OLS = LinearRegression(fit_intercept=True)
         OLS_dict[cv_i] = OLS.fit(F_train.iloc[:,:nfactors], Y_train)
         Y_hat = OLS_dict[cv_i].predict(F_val.iloc[:,:nfactors])
         val_err[:, cv_i] = Y_val.values-Y_hat
@@ -600,10 +732,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_PCR = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['PCR',seed] = pd.DataFrame()
-    Validation_Err['PCR',seed]['nfactors_list'] = nfactors_list
-    Validation_Err['PCR',seed]['val_err'] = val_err_PCR
+    PCR_VE_out = {'Model':['PCR']*2,
+                  'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','nfactors'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        PCR_VE_out[cn] = [nfactors_list[i], val_err_PCR[i]]
 
+    PCR_VE_out = pd.DataFrame(PCR_VE_out)
 
     plt.plot(nfactors_list, val_err_PCR)
     plt.xlabel('Number of principal components')
@@ -634,20 +774,13 @@ for seed in seed_list:
     ###################################  RKHS regression  #################################
     #######################################################################################
 
-    @numba.njit
-    def get_Gram_rbf(X_train, X_test, n_train, n_test, gamma):
-        Gram_rbf = np.zeros((n_test,n_train))
-        for t in range(n_test):
-            Gram_rbf[t,:] = np.exp(-gamma*np.sum((X_test[t,:]-X_train)**2,1))
-        return Gram_rbf
-
     gamma = 1/X_train_stzd.shape[1]
     Kernel_Gram = get_Gram_rbf(X_train_stzd.values,X_train_stzd.values, n_train, n_train, gamma)
     K_val = get_Gram_rbf(X_train_stzd.values, X_val_stzd.values, n_train, n_val, gamma)
     K_test = get_Gram_rbf(X_train_stzd.values, X_test_stzd.values, n_train, n_test, gamma)
     
     
-    lam_list = np.linspace(1e-15,500,50)
+    lam_list = np.linspace(1e-15,500,CV_grid_n)
     val_err = np.zeros((n_val, len(lam_list)))
     RKHS_dict = {}
     for cv_i, lam in enumerate(lam_list):
@@ -660,10 +793,19 @@ for seed in seed_list:
     
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_RKHS = np.mean(np.array(val_err)**2, axis=0)
+    
+    RKHS_VE_out = {'Model':['RKHS']*2,
+                   'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','lambda'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        RKHS_VE_out[cn] = [lam_list[i], val_err_RKHS[i]]
 
-    Validation_Err['RKHS',seed] = pd.DataFrame()
-    Validation_Err['RKHS',seed]['lam_list'] = lam_list
-    Validation_Err['RKHS',seed]['val_err'] = val_err_RKHS
+    RKHS_VE_out = pd.DataFrame(RKHS_VE_out)
     
     plt.plot(lam_list, val_err_RKHS)
     plt.xlabel('alpha')
@@ -694,81 +836,6 @@ for seed in seed_list:
             }
     RKHS_out = pd.DataFrame.from_dict(RKHS_out)
 
-    # #######################################################################################
-    # ###################################  RKHS regression  #################################
-    # #######################################################################################
-
-    # @numba.njit
-    # def get_Gram_rbf(X_train, X_test, n_train, n_test, gamma):
-    #     Gram_rbf = np.zeros((n_test,n_train))
-    #     for t in range(n_test):
-    #         Gram_rbf[t,:] = np.exp(-gamma*np.sum((X_test[t,:]-X_train)**2,1))
-    #     return Gram_rbf
-
-    # gamma = 1/X_train_stzd.shape[1]
-    # Kernel_Gram = get_Gram_rbf(X_train_stzd.values,X_train_stzd.values, n_train, n_train, gamma)
-    # eigenvalues, eigenvectors = np.linalg.eigh(Kernel_Gram)
-
-    # idx = eigenvalues.argsort()[::-1]
-    # eigval_sorted = eigenvalues[idx]
-    # eigvec_sorted = eigenvectors[:, idx]
-
-    # F_train = eigvec_sorted*eigval_sorted
-    # K_val = get_Gram_rbf(X_train_stzd.values, X_val_stzd.values, n_train, n_val, gamma)
-    # K_test = get_Gram_rbf(X_train_stzd.values, X_test_stzd.values, n_train, n_test, gamma)
-    # F_val = K_val@eigvec_sorted
-    # F_test = K_test@eigvec_sorted
-    
-    # alpha_list = np.linspace(1e-15,10,50)
-    # val_err = np.zeros((n_val, len(nfactors_list)))
-    # lam = 0
-    # RKHS_dict = {}
-    # for cv_i, nfactors in enumerate(nfactors_list):
-        
-    #     delta_hat = np.linalg.inv(F_train[:,:nfactors].T@F_train[:,:nfactors]+lam*np.diag(eigval_sorted[:nfactors]))@F_train[:,:nfactors].T@Y_train
-        
-    #     Y_hat = F_val[:,:nfactors]@delta_hat
-    #     RKHS_dict[cv_i] = delta_hat
-    #     val_err[:, cv_i] = Y_val.values-Y_hat
-
-    # min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
-    # val_err_RKHS = np.mean(np.array(val_err)**2, axis=0)
-
-    # Validation_Err['RKHS'] = pd.DataFrame()
-    # Validation_Err['RKHS']['nfactors_list'] = nfactors_list
-    # Validation_Err['RKHS']['val_err'] = val_err_RKHS
-    
-    # plt.plot(nfactors_list, val_err_RKHS)
-    # plt.xlabel('Number of principal components')
-    # plt.title('Validation Error, PCR,Minimum=%i'%nfactors_list[min_idx])
-    # # # plt.show()
-    # # plt.savefig("Figures/PCR_validation_seed%i.png"%seed)
-    # # plt.close()
-    # # # plt.show()
-    
-    # # temp = LinearRegression(fit_intercept=True)
-    # # temp.fit(pd.concat((V_train,W_train_stzd),axis=1),Y_train)
-    # # Y_hat = temp.predict(pd.concat((V_test,W_test_stzd),axis=1))
-    
-    
-    # Y_hat = F_test[:,:nfactors_list[min_idx]]@RKHS_dict[min_idx]
-    # test_err_RKHS = Y_test.values - Y_hat
-    # RMSE_RKHS = np.sqrt(np.sum(test_err_RKHS**2)/len(test_err_RKHS))
-
-    # RKHS_out = {'Date': Date_used[forecast_idx].dt.strftime("%m/%d/%Y").values,
-    #         'Target': Target,
-    #         'Value': Y_test.values,
-    #         'Prediction': Y_hat,
-    #         'Model': 'PCR',
-    #         'Seed': seed,
-    #         'Parameter': str(nfactors_list[min_idx]),
-    #         'Window_size': n_train,
-    #         'Validation_size': n_val,
-    #         'Transformation': Transformation
-    #         }
-    # RKHS_out = pd.DataFrame.from_dict(RKHS_out)
-
-
     #######################################################################################
     ###################################   Neural Net    ###################################
     #######################################################################################
@@ -776,10 +843,9 @@ for seed in seed_list:
     np.random.seed(seed)
     random.seed(seed)
 
-
     batch_size = X_train_nnan.shape[0]
     epochs = 20
-    n_node_list = np.linspace(1,37,19).astype(int)
+    n_node_list = np.linspace(1,37,CV_grid_n).astype(int)
     val_err = np.zeros((n_val, len(n_node_list)))
     model_FF_dict = {}
     for cv_i, n_node in enumerate(n_node_list):
@@ -807,9 +873,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_NN = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['NN',seed] = pd.DataFrame()
-    Validation_Err['NN',seed]['n_node_list'] = n_node_list
-    Validation_Err['NN',seed]['val_err'] = val_err_NN
+    NN_VE_out = {'Model':['NN']*2,
+                 'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','n_node'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        NN_VE_out[cn] = [n_node_list[i], val_err_NN[i]]
+
+    NN_VE_out = pd.DataFrame(NN_VE_out)
 
     plt.plot(n_node_list, val_err_NN)
     plt.xlabel('Number of Nodes')
@@ -821,7 +896,6 @@ for seed in seed_list:
     Y_hat = model_FF_dict[min_idx].predict(X_test_nnan,verbose=0)
     test_err_FF = Y_test.values - Y_hat.reshape((-1,))
     RMSE_FF = np.sqrt(np.sum(test_err_FF**2)/len(test_err_FF))
-
 
     NN_out = {'Date': Date_used[forecast_idx].dt.strftime("%m/%d/%Y").values,
             'Target': Target,
@@ -836,16 +910,32 @@ for seed in seed_list:
             }
     NN_out = pd.DataFrame.from_dict(NN_out)
 
-
-    out = np.concatenate((RW_out.values, AR1_out.values, AR12_out.values, AR_out.values,RF_out.values, XGB_out.values, XGBs_out.values, Ridge_out.values, Lasso_out.values,AdaLasso_out.values, PCR_out.values, RKHS_out.values, NN_out.values), axis=0)
+    out = np.concatenate((RW_out.values, AR1_out.values, AR12_out.values, AR1_12_out.values,
+                           RA_out.values, AR_out.values,RF_out.values, XGB_out.values,
+                             XGBs_out.values, Ridge_out.values, Lasso_out.values,
+                             AdaLasso_out.values, PCR_out.values, RKHS_out.values, NN_out.values), axis=0)
 
     query = ''' insert or replace into Results (Date,Target,Value,Prediction,Model,Seed,Parameter,Window_size,Validation_size,Transformation) values (?,?,?,?,?,?,?,?,?,?) '''
     cur.executemany(query, out)
     con.commit()
+
+    
+    str_append = ''
+    for s in np.arange(1,CV_grid_n+1):
+        str_append = str_append+', col_%i'%s
+
+    s = ','.join(['?']*(CV_grid_n+7))
+    query = "insert or replace into CV_Error (Model, Target, Tune_Param, Seed, Transformation, Window_size, Validation_size"+str_append+") values ("+ s+ ")"
+
+    out1 = AR_VE_out.values
+    out2 = pd.concat((RA_VE_out, RF_VE_out, XGB_VE_out, XGBs_VE_out, Ridge_VE_out, Lasso_VE_out,
+                       AdaLasso_VE_out, PCR_VE_out, RKHS_VE_out, NN_VE_out),axis=0).values
+
+    cur.executemany(query, out1)
+    con.commit()
+
+    cur.executemany(query, out2)
+    con.commit()
+    
+    cur.close()
     con.close()
-
-
-file_name ='Validation_Err_%s.pkl'%(Transformation.replace(' ','_'))
-
-with open(os.path.join('Results', file_name), 'wb') as outp:
-    pickle.dump(Validation_Err, outp)

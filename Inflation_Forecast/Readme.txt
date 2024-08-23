@@ -1,11 +1,11 @@
-main.py:			Forecast year over year inflation with vanilla ML methods and store the results in the database
-main_PL_lag2.py:		Forecast year over year inflation with partially linear model and store the results in the database
+main.py:			Forecast inflation with vanilla ML methods and store the results in the database
+main_PL_lag1.py:		Forecast inflation with partially linear model where linear part has one lag and store the results in the database
+main_PL_lag2.py:		Forecast inflation with partially linear model where linear part has two lags and store the results in the database
 
-main_MoM.py:		Forecast month over month inflation with vanilla ML methods and store the results in the database
-main_PL_MoM_lag1.py:	Forecast month over month inflation with partially linear model and store the results in the database
-
-get_results.ipynb:		Import year over year inflation forecasting results and make tables, figures, etc.
-get_results_MoM.ipynb:	Import month over month inflation forecasting results and make tables, figures, etc.
+get_results.ipynb:		Import results from the database and make table/plot figures
 
 main-1st-day.ipynb:		Forecast year over year inflation using only models covered in the 1st day
 main-1st-day-MoM.ipynb:	Forecast month over month inflation using only models covered in the 1st day
+
+main-2nd-day.ipynb:		Forecast year over year inflation using KRR and partially linear KRR
+main-2nd-day-MoM.ipynb:	Forecast month over month inflation using KRR and partially linear KRR

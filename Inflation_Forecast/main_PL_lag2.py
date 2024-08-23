@@ -2,7 +2,6 @@
 ## Target variable: Year over Year inflation
 ## Partially Linear Model with 2 lags as linear part
 import os
-import time
 import pickle
 import sqlite3
 import numba
@@ -10,13 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import Lasso
 from functions import get_data
-from sklearn.linear_model import Ridge
 from sklearn.linear_model import LinearRegression
 import sqlite3
 import random
-import re
 import xgboost as xgb
 import tensorflow as tf
 # from functions import *
@@ -34,7 +30,11 @@ Transformation = 'Transform'
 
 Target = 'Inflation'
 
-lags = 12
+if Target =='Inflation':
+    lags = 12
+elif Target =='Inflation MoM':
+    lags = 1
+
 X_used, Y_used, Date_used = get_data(Transformation, lags)
 
 num_lags = 2
@@ -80,6 +80,7 @@ beta_tot = {}
 
 # Seed number used
 seed_list = [42, 43, 44, 45, 46]
+CV_grid_n = 30
 
 database_name = 'database_predict_inflation.db'
 for seed in seed_list:
@@ -108,10 +109,29 @@ for seed in seed_list:
         print("DATABASE ALREADY EXISTS")
         con.commit()
 
+    if ~np.isin('CV_Error', table_names):
+        print("CREATE NEW DATABASE TABLE")
+        str_append = ''
+        for s in np.arange(1,CV_grid_n+1):
+            str_append = str_append+'col_%i REAL, '%s
+
+        cur.execute("""CREATE TABLE IF NOT EXISTS CV_Error(
+                    Model TEXT NOT NULL,
+                    Target TEXT NOT NULL,
+                    Tune_Param TEXT NOT NULL,
+                    Seed INTEGER NOT NULL,
+                    Transformation TEXT NOT NULL,
+                    Window_size INTEGER NOT NULL,
+                    Validation_size INTEGER NOT NULL,"""\
+                    + str_append\
+                    + """PRIMARY KEY (Model, Target, Tune_Param, Seed, Transformation, Window_size, Validation_size))""")
+        con.commit()
+    else:
+        print("DATABASE TABLE ALREADY EXISTS")
     #######################################################################################
     #######################   Partially Linear Random Forest  #############################
     #######################################################################################
-    max_depth_list = np.append(np.arange(1,50,3),None)
+    max_depth_list = np.append(np.linspace(1,50,CV_grid_n-1).astype(int),None)
     val_err = np.zeros((n_val, len(max_depth_list)))
     RFmodel_dict = {}
     beta_dict_RF = {}
@@ -141,10 +161,20 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_RF = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['RF',seed] = pd.DataFrame()
-    Validation_Err['RF',seed]['max_depth_list'] = max_depth_list
-    Validation_Err['RF',seed]['val_err'] = val_err_RF
-    beta_tot['RF',seed] = beta_dict_RF[min_idx]
+
+    temp_grid = ['None' if x==None else x for x in max_depth_list]
+    RF_VE_out = {'Model':['Random Forest-PL-%ilags' %num_lags,]*2,
+                 'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','max_depth'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        RF_VE_out[cn] = [temp_grid[i], val_err_RF[i]]
+
+    RF_VE_out = pd.DataFrame(RF_VE_out)
     
     # temp_grid = ['None' if x==None else x for x in max_depth_list]
     # plt.plot(temp_grid, val_err_RF)
@@ -175,7 +205,7 @@ for seed in seed_list:
     #######################################################################################
     ###################################   XGBoost  ########################################
     #######################################################################################
-    n_estimators_list = np.arange(1,50,3)
+    n_estimators_list = np.linspace(1,50,CV_grid_n).astype(int)
     val_err = np.zeros((n_val,len(n_estimators_list)))
     XGBmodel_dict = {}
     beta_dict_XGB = {}
@@ -203,10 +233,19 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_XGB = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['XGB',seed] = pd.DataFrame()
-    Validation_Err['XGB',seed]['n_estimators_list'] = n_estimators_list
-    Validation_Err['XGB',seed]['val_err'] = val_err_XGB
-    beta_tot['XGB',seed] = beta_dict_XGB[min_idx]
+    XGB_VE_out = {'Model':['XGBoost-PL-%ilags' %num_lags]*2,
+                  'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','n_estimators'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        XGB_VE_out[cn] = [n_estimators_list[i], val_err_XGB[i]]
+
+    XGB_VE_out = pd.DataFrame(XGB_VE_out)
+
 
     # plt.plot(n_estimators_list,val_err_XGB)
     # plt.xlabel('n_estimators')
@@ -239,7 +278,7 @@ for seed in seed_list:
 
     num_parallel_tree = 100
     subsample = np.sqrt(W_train_nnan.shape[0])/W_train_nnan.shape[0]
-    n_estimators_list = np.arange(1,50,3)
+    n_estimators_list = np.linspace(1,50,CV_grid_n).astype(int)
     val_err = np.zeros((n_val,len(n_estimators_list)))
     XGBmodel_dict = {}
     beta_dict_XGBs = {}
@@ -269,10 +308,19 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_XGBs = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['XGBs',seed] = pd.DataFrame()
-    Validation_Err['XGBs',seed]['n_estimators_list'] = n_estimators_list
-    Validation_Err['XGBs',seed]['val_err'] = val_err_XGBs
-    beta_tot['XGBs',seed] = beta_dict_XGBs[min_idx]
+    XGBs_VE_out = {'Model':['XGBoost-subsample-PL-%ilags' %num_lags]*2,
+                   'Target':[Target]*2,
+                    'Tune_Param': ['CV_grid','n_estimators'],
+                    'Seed':[seed]*2,
+                    'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        XGBs_VE_out[cn] = [n_estimators_list[i], val_err_XGBs[i]]
+
+    XGBs_VE_out = pd.DataFrame(XGBs_VE_out)
+
 
     # plt.plot(n_estimators_list, val_err_XGBs)
     # plt.xlabel('n_estimators')
@@ -327,7 +375,7 @@ for seed in seed_list:
     # plt.show()
 
 
-    nfactors_list = np.arange(1,20)
+    nfactors_list = np.linspace(1,200,CV_grid_n).astype(int)
     val_err = np.zeros((n_val, len(nfactors_list)))
     nfactors = 2
     PCR_dict = {}
@@ -346,10 +394,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_PCR = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['PCR',seed] = pd.DataFrame()
-    Validation_Err['PCR',seed]['nfactors_list'] = nfactors_list
-    Validation_Err['PCR',seed]['val_err'] = val_err_PCR
-    beta_tot['PCR',seed] = beta_dict_PCR[min_idx]
+    PCR_VE_out = {'Model':['PCR-PL-%ilags' %num_lags]*2,
+                  'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','nfactors'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        PCR_VE_out[cn] = [nfactors_list[i], val_err_PCR[i]]
+
+    PCR_VE_out = pd.DataFrame(PCR_VE_out)
 
     # plt.plot(nfactors_list, val_err_PCR)
     # plt.xlabel('Number of principal components')
@@ -411,7 +467,7 @@ for seed in seed_list:
     # plt.show()
 
 
-    nfactors_list = np.arange(1,20)
+    nfactors_list = np.linspace(1,50,CV_grid_n).astype(int)
     val_err = np.zeros((n_val, len(nfactors_list)))
     nfactors = 2
     PCRp_dict = {}
@@ -429,10 +485,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_PCRp = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['PCRp',seed] = pd.DataFrame()
-    Validation_Err['PCRp',seed]['nfactors_list'] = nfactors_list
-    Validation_Err['PCRp',seed]['val_err'] = val_err_PCRp
-    beta_tot['PCRp',seed] = beta_dict_PCRp[min_idx]
+    PCRp_VE_out = {'Model':['PCRp-PL-%ilags' %num_lags]*2,
+                  'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','nfactors'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        PCRp_VE_out[cn] = [nfactors_list[i], val_err_PCRp[i]]
+
+    PCRp_VE_out = pd.DataFrame(PCRp_VE_out)
 
     # plt.plot(nfactors_list, val_err_PCRp)
     # plt.xlabel('Number of principal components')
@@ -493,7 +557,7 @@ for seed in seed_list:
 
     V_train_one = np.concatenate((np.ones((n_train,1)),V_train.values,),axis=1)
     M_v = (np.identity(n_train)-V_train_one@np.linalg.inv(V_train_one.T@V_train_one)@V_train_one.T)
-    lambda_list = np.linspace(0,500,100)
+    lambda_list = np.linspace(1e-15,500,CV_grid_n)
     val_err = np.zeros((n_val,len(lambda_list)))
     
     for cv_j, lam in enumerate(lambda_list):
@@ -510,11 +574,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_RKHS = np.mean(np.array(val_err)**2, axis=0)
     
-    Validation_Err['RKHS',seed] = {}
-    Validation_Err['RKHS',seed]['nfactors_list'] = nfactors_list
-    Validation_Err['RKHS',seed]['lambda_list'] = lambda_list
-    Validation_Err['RKHS',seed]['val_err'] = val_err_RKHS
-    beta_tot['RKHS',seed] = beta_hat_dict[min_idx]
+    RKHS_VE_out = {'Model':['RKHS-PL-%ilags' %num_lags]*2,
+                   'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','lambda'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        RKHS_VE_out[cn] = [lambda_list[i], val_err_RKHS[i]]
+
+    RKHS_VE_out = pd.DataFrame(RKHS_VE_out)
 
     # plt.plot(lambda_list, val_err_RKHS)
     # plt.xlabel('alpha')
@@ -538,114 +609,6 @@ for seed in seed_list:
             'Transformation': Transformation
             }
     RKHS_out = pd.DataFrame.from_dict(RKHS_out)
-    # #######################################################################################
-    # ################################# RKHS with l2 penalty ###############################
-    # #######################################################################################
-    # W_train_stzd = (W_train_nnan - np.mean(W_train_nnan, axis=0))/np.std(W_train_nnan, axis = 0)
-    # W_val_stzd = (W_val_nnan - np.mean(W_train_nnan, axis=0))/np.std(W_train_nnan, axis = 0)
-    # W_test_stzd = (W_test_nnan - np.mean(W_train_nnan, axis=0))/np.std(W_train_nnan, axis = 0)
-
-    # Sigma_hat = W_train_stzd.T@W_train_stzd/n_train
-    # eigval, eigvec = np.linalg.eig(Sigma_hat)
-    # eigval = np.real(eigval)
-    # eigvec = np.real(eigvec)
-    # idx = eigval.argsort()[::-1]
-    # eigval_sorted = eigval[idx]
-    # eigvec_sorted = eigvec[:, idx]
-
-    # @numba.njit
-    # def get_Gram_rbf(X_train, X_test, n_train, n_test, gamma):
-    #     Gram_rbf = np.zeros((n_test,n_train))
-    #     for t in range(n_test):
-    #         Gram_rbf[t,:] = np.exp(-gamma*np.sum((X_test[t,:]-X_train)**2,1))
-    #     return Gram_rbf
-    
-
-    # gamma = (1/W_test_stzd.shape[1])
-    # Kernel_Gram = get_Gram_rbf(W_train_stzd.values,W_train_stzd.values, n_train,n_train,gamma)
-    # eigenvalues, eigenvectors = np.linalg.eigh(Kernel_Gram) 
-
-    # idx = eigenvalues.argsort()[::-1]
-    # eigval_sorted = eigenvalues[idx]
-    # eigvec_sorted = eigenvectors[:, idx]
-
-    # F_train = pd.DataFrame(eigvec_sorted*eigval_sorted)
-
-    # K_val = get_Gram_rbf(W_train_stzd.values, W_val_stzd.values, n_train, n_val, gamma)
-    # K_test = get_Gram_rbf(W_train_stzd.values, W_test_stzd.values, n_train, n_test, gamma)
-    # F_val = pd.DataFrame(K_val@eigvec_sorted)
-    # F_test = pd.DataFrame(K_test@eigvec_sorted)
-
-
-    # nfactors_list = np.arange(1,20)
-    # delta_hat_dict = {}
-    # beta_hat_dict = {}
-    # nfactors_price = 8
-
-    # V_train_one = np.concatenate((np.ones((n_train,1)),V_train.values,),axis=1)
-    # F_train_proj = (np.identity(n_train)-V_train_one@np.linalg.inv(V_train_one.T@V_train_one)@V_train_one.T)@F_train
-    # lambda_list = np.linspace(0,50,100)
-    # val_err = np.zeros((n_val, len(nfactors_list), len(lambda_list)))
-    # for cv_i, nfactors in enumerate(nfactors_list):
-    #     for cv_j, lam in enumerate(lambda_list):
-    #         F_train_used = F_train.iloc[:,:nfactors]
-    #         F_train_proj_used = F_train_proj.iloc[:,:nfactors]
-            
-    #         delta_hat = np.linalg.inv(F_train_used.T@F_train_proj_used + lam*np.diag(eigval_sorted[:nfactors]))@(F_train_proj_used.T@Y_train)
-    #         # alpha_hat = eigvec_sorted[:,:nfactors]@delta_hat
-    #         # beta_hat = np.linalg.inv(V_train.values.T@V_train.values)@V_train.values.T@(Y_train-Kernel_Gram@alpha_hat)
-    #         beta_hat = np.linalg.inv(V_train_one.T@V_train_one)@V_train_one.T@(Y_train-(eigvec_sorted[:,:nfactors]*eigval_sorted[:nfactors])@delta_hat)
-            
-    #         Y_hat = np.concatenate((np.ones((n_val,1)),V_val.values,),axis=1)@beta_hat + F_val.iloc[:,:nfactors]@delta_hat
-    #         delta_hat_dict[cv_i,cv_j] = delta_hat
-    #         beta_hat_dict[cv_i,cv_j] = beta_hat
-    #         val_err[:, cv_i,cv_j] = Y_val.values-Y_hat.values
-
-
-    # min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
-    # min_idx_i,min_idx_j = np.unravel_index(min_idx, np.mean(np.array(val_err)**2, axis=0).shape)
-    # val_err_RKHS = np.mean(np.array(val_err)**2, axis=0)
-    # val_err_RKHS[min_idx_i,min_idx_j]
-    # np.min(val_err_RKHS)
-    
-    # Validation_Err['RKHS'] = {}
-    # Validation_Err['RKHS']['nfactors_list'] = nfactors_list
-    # Validation_Err['RKHS']['lambda_list'] = lambda_list
-    # Validation_Err['RKHS']['val_err'] = val_err_RKHS
-    # beta_tot['RKHS'] = beta_hat_dict[min_idx_i,min_idx_j][1:]
-
-    
-
-    # plt.plot(lambda_list, val_err_RKHS[min_idx_i,:])
-    # plt.xlabel('alpha')
-    # plt.title('Validation Error, RKHS, Dim=%i, argmin=%0.2f'%(nfactors_list[min_idx_i],lambda_list[min_idx_j]))
-    # plt.show()
-    
-    # plt.plot(nfactors_list, val_err_RKHS[:,min_idx_j])
-    # plt.xlabel('Number of principal components')
-    # plt.title('Validation Error, RKHS, alpha=%0.2f, argmin=%i'%(lambda_list[min_idx_j],nfactors_list[min_idx_i]))
-    # plt.show()
-    
-    # # temp = LinearRegression(fit_intercept=True)
-    # # temp.fit(pd.concat((V_train,W_train_stzd),axis=1),Y_train)
-    # # Y_hat = temp.predict(pd.concat((V_test,W_test_stzd),axis=1))
-
-    # Y_hat = np.concatenate((np.ones((n_test,1)),V_test.values),axis=1)@beta_hat_dict[min_idx_i,min_idx_j] + F_test.iloc[:,:nfactors_list[min_idx_i]]@delta_hat_dict[min_idx_i,min_idx_j]
-    # test_err_PCR = Y_test.values - Y_hat.values
-    # RMSE_RKHS = np.sqrt(np.sum(test_err_PCR**2)/len(test_err_PCR))
-
-    # RKHS_out = {'Date': Date_used[forecast_idx].dt.strftime("%m/%d/%Y").values,
-    #         'Target': Target,
-    #         'Value': Y_test.values,
-    #         'Prediction': Y_hat,
-    #         'Model': 'PCR-PL-%ilags' %num_lags,
-    #         'Seed': seed,
-    #         'Parameter': 'alpha%f_nf%i'%(lambda_list[min_idx_j],nfactors_list[min_idx_i]),
-    #         'Window_size': n_train,
-    #         'Validation_size': n_val,
-    #         'Transformation': Transformation
-    #         }
-    # RKHS_out = pd.DataFrame.from_dict(RKHS_out)
     
     
     #######################################################################################
@@ -657,7 +620,7 @@ for seed in seed_list:
 
     batch_size = W_train_nnan.shape[0]
     epochs = 20
-    n_node_list = np.linspace(1,37,19).astype(int)
+    n_node_list = np.linspace(1,37,CV_grid_n).astype(int)
     val_err = np.zeros((n_val, len(n_node_list)))
     model_NN_dict = {}
     beta_dict_NN = {}
@@ -722,10 +685,18 @@ for seed in seed_list:
     min_idx = np.argmin(np.mean(np.array(val_err)**2, axis=0))
     val_err_NN = np.mean(np.array(val_err)**2, axis=0)
 
-    Validation_Err['NN',seed] = pd.DataFrame()
-    Validation_Err['NN',seed]['n_node_list'] = n_node_list
-    Validation_Err['NN',seed]['val_err'] = val_err_NN
-    beta_tot['NN',seed] = beta_dict_NN[min_idx]
+    NN_VE_out = {'Model':['NN-PL-%ilags' %num_lags]*2,
+                 'Target':[Target]*2,
+                'Tune_Param': ['CV_grid','n_node'],
+                'Seed':[seed]*2,
+                'Transformation': Transformation,
+                'Window_size': n_train,
+                'Validation_size': n_val}
+    col_names = ['col_%i'%i for i in range(1,CV_grid_n+1)] 
+    for i,cn in enumerate(col_names):
+        NN_VE_out[cn] = [n_node_list[i], val_err_NN[i]]
+
+    NN_VE_out = pd.DataFrame(NN_VE_out)
 
     # plt.plot(n_node_list, val_err_NN)
     # plt.xlabel('Number of Nodes')
@@ -756,13 +727,19 @@ for seed in seed_list:
     query = ''' insert or replace into Results (Date,Target,Value,Prediction,Model,Seed,Parameter,Window_size,Validation_size,Transformation) values (?,?,?,?,?,?,?,?,?,?) '''
     cur.executemany(query, out)
     con.commit()
+    
+    
+    str_append = ''
+    for s in np.arange(1,CV_grid_n+1):
+        str_append = str_append+', col_%i'%s
+
+    s = ','.join(['?']*(CV_grid_n+7))
+    query = "insert or replace into CV_Error (Model, Target, Tune_Param, Seed, Transformation, Window_size, Validation_size"+str_append+") values ("+ s+ ")"
+    
+    out = pd.concat((RF_VE_out, XGB_VE_out, XGBs_VE_out, PCR_VE_out, RKHS_VE_out, NN_VE_out),axis=0).values
+
+    cur.executemany(query, out)
+    con.commit()
+    
+    cur.close()
     con.close()
-
-file_name1 ='Validation_Err_PL_%ilags_%s.pkl'%(num_lags, Transformation.replace(' ','_'))
-file_name2 ='beta_tot_PL_%ilags_%s.pkl'%(num_lags,Transformation.replace(' ','_'))
-
-with open(os.path.join('Results', file_name1), 'wb') as outp:
-    pickle.dump(Validation_Err, outp)
-
-with open(os.path.join('Results', file_name2), 'wb') as outp:
-    pickle.dump(beta_tot, outp)
